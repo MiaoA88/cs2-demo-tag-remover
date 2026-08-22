@@ -1,177 +1,144 @@
 # -*- coding: utf-8 -*-
 """Remove name tags from a CS2 (Source 2) demo file.
 
-Principle
----------
-Some skin tools write a fixed custom name (by default "CS2 INSIGHT AGENT",
-see DEFAULT_TAG) into the item entity data of a demo. The name tag lives in
-entity *bit streams* (ClassInfo / instance baselines), so it is usually NOT
-byte-aligned.
+Where the tag lives
+-------------------
+A custom item name (``m_szCustomName``) is a NUL-terminated string inside
+``CSVCMsg_PacketEntities.entity_data``, an unaligned entity bit stream nested
+like this::
+
+    DEM_Packet / DEM_SignonPacket -> CDemoPacket.data     -> container
+    DEM_FullPacket -> CDemoFullPacket.packet -> .data     -> container
+    container -> svc_PacketEntities (55) -> entity_data (field 7)
 
 Search strategy
 ---------------
-For a tag starting at bit offset `B` (B % 8 = s) inside the stream, the bytes
-*after* the first partial byte are fully determined by the tag itself (no
-dependency on preceding fields). So for each s in 0..7 we build the byte
-pattern of the tag bit stream starting at bit (8 - s) and use C-level
-`bytes.find`. Every hit is then verified bit-by-bit (the first partial byte
-is checked here).
+For a tag starting at bit offset ``B`` (``B % 8 == s``) the whole bytes *inside*
+the tag are fully determined by the tag itself, so for each of the 8 alignments
+a byte pattern is built and located with C-level ``bytes.find``; every candidate
+is then verified bit by bit (:func:`proto_utils.pattern_hits`). The search runs
+on ``entity_data`` itself, so the offsets it yields address the entity stream
+directly.
 
 Deletion strategy
 -----------------
-The tag bytes are *deleted* from the bit stream (the NUL terminator stays), so
-the custom name decodes to the empty string.  This matters because CS2 draws
-quotes around *non-empty* custom names -- replacing the tag with spaces makes
-the game show `"   "`.  An empty name renders as nothing at all.
+The tag bytes are *deleted* and the NUL terminator kept, so the name decodes to
+the empty string -- CS2 draws quotes around non-empty names, so padding with
+spaces would show ``"   "`` instead of nothing.
 
-Deleting bits shrinks the payload, so every enclosing structure is rewritten:
-  1. the innermost entity bit stream (bits shifted left),
-  2. protobuf length varints of enclosing messages,
-  3. the CDemoPacket-style container around entity data
-     (msg type u_bit_var + byte-size varint per message) -- the size of the
-     affected message is decremented.
+Deleting bits shrinks every enclosing structure, all of which are rewritten:
+the entity's ``serialized_entities`` bit length, the protobuf length varints,
+and the container's per-message byte-size varint (its trailing padding bits are
+preserved).
 """
 from __future__ import annotations
 
 from demo_frames import DemoFile
-from proto_utils import ProtoError, proto_delete_bits
+from entity_data import PACKET_ENTITIES, strip_entity_data
+from proto_utils import (ProtoError, encode_container, encode_fields,
+                         parse_container, parse_fields, pattern_hits)
 
-#: Tag text removed by default (bytes; the NUL terminator that follows it in
-#: the bit stream is kept, so the custom name decodes to an empty string).
-DEFAULT_TAG = b"CS2 INSIGHT AGENT"
-
-#: Frame types whose payloads carry entity data. The tag has only ever been
-#: observed there, so the fast default mode scans just these frame types.
+#: DEM_Packet, DEM_SignonPacket, DEM_FullPacket -- the only frames that carry a
+#: ``CDemoPacket`` and therefore entity data.
 ENTITY_FRAME_TYPES = frozenset({7, 8, 13})
+FULL_PACKET = 13
+
+#: ``CDemoPacket.data`` and ``CDemoFullPacket.packet``.
+F_PACKET_DATA = 3
+F_FULLPACKET_PACKET = 2
 
 
-def _pattern_bits(pattern: bytes):
-    """LSB-first bit list of the pattern."""
-    bits = []
-    for b in pattern:
-        for i in range(8):
-            bits.append((b >> i) & 1)
-    return bits
-
-
-def _suffix_patterns(pattern: bytes):
-    """Return 8 (shift, suffix_bytes) pairs.
-
-    If the tag starts at bit offset B with B % 8 == s, the payload bytes at
-    positions (B//8 + 1) .. (B//8 + len(suffix)) equal `suffix_bytes` -- and
-    crucially those bytes depend only on the tag, not on preceding fields.
-    """
-    pb = _pattern_bits(pattern)
+def _strip_container(blob, tags):
+    """Strip tags from every ``svc_PacketEntities`` in a ``CDemoPacket.data`` blob."""
+    messages, tail, tail_bits = parse_container(blob)
+    removed = 0
     out = []
-    for s in range(8):
-        bits = pb[8 - s:]  # skip the first (8 - s) bits of the tag
-        nbytes = (len(bits) + 7) // 8
-        buf = bytearray(nbytes)
-        for k, b in enumerate(bits):
-            if b:
-                buf[k >> 3] |= 1 << (k & 7)
-        out.append((s, bytes(buf)))
-    return out
+    for msg_type, payload in messages:
+        if msg_type == PACKET_ENTITIES:
+            payload, n = strip_entity_data(payload, tags)
+            removed += n
+        out.append((msg_type, payload))
+    if not removed:
+        return blob, 0
+    return encode_container(out, tail, tail_bits), removed
 
 
-def _verify_full(data, start_bit, pat_bits):
-    n = len(data)
-    if start_bit < 0 or start_bit + len(pat_bits) > n * 8:
-        return False
-    for k, pb in enumerate(pat_bits):
-        bit = start_bit + k
-        if ((data[bit >> 3] >> (bit & 7)) & 1) != pb:
-            return False
-    return True
+def _strip_nested(message, field_no, strip, tags):
+    """Apply `strip` to the first occurrence of length-delimited field `field_no`."""
+    fields = parse_fields(message)
+    removed = 0
+    out = []
+    for fno, wt, value in fields:
+        if fno == field_no and wt == 2 and not removed:
+            value, removed = strip(value, tags)
+        out.append((fno, wt, value))
+    if not removed:
+        return message, 0
+    return encode_fields(out), removed
 
 
-def find_tag_positions(data: bytes, pattern: bytes) -> list[int]:
-    """Return a list of bit offsets where `pattern` occurs in `data`
-    (arbitrary bit alignment, fast C-level suffix search + bit verify)."""
-    pat_bits = _pattern_bits(pattern)
-    hits = []
-    for s, suffix in _suffix_patterns(pattern):
-        pos = 0
-        while True:
-            idx = data.find(suffix, pos)
-            if idx < 0:
-                break
-            start_bit = idx * 8 - (8 - s)
-            if _verify_full(data, start_bit, pat_bits):
-                hits.append(start_bit)
-            pos = idx + 1
-    return hits
+def strip_frame_payload(payload: bytes, msg_type: int, tags) -> tuple[bytes, int]:
+    """Strip tags from one decompressed entity frame. Returns (payload, removed).
+
+    Raises ProtoError when the frame's structure does not parse; the caller then
+    leaves the frame untouched.
+    """
+    if msg_type == FULL_PACKET:
+        return _strip_nested(
+            payload, F_FULLPACKET_PACKET,
+            lambda packet, t: _strip_nested(packet, F_PACKET_DATA, _strip_container, t),
+            tags)
+    return _strip_nested(payload, F_PACKET_DATA, _strip_container, tags)
 
 
-def strip_name_tags(demo: DemoFile, tags=(DEFAULT_TAG,), deep=False, progress=None) -> tuple[int, int]:
-    """Delete every occurrence of any of `tags` from the demo frames.
+def strip_name_tags(demo: DemoFile, tags, progress=None) -> tuple[int, int, int]:
+    """Delete every occurrence of any of `tags` from the demo's entity frames.
 
-    The tag bytes are *deleted* from the bit stream (the NUL terminator stays),
-    so the custom name decodes to the empty string and CS2 does not draw the
-    name (nor the quotes it renders around non-empty names).
+    `tags` is the text to remove, as ``bytes`` or ``str``; at least one non-empty
+    entry is required. The NUL terminator that follows a name in the bit stream
+    is kept, so the custom name decodes to an empty string.
 
-    With ``deep=False`` only compressed entity-data frames are scanned (fast;
-    the tags have only ever been observed there). With ``deep=True`` every
-    frame is scanned, compressed or not.
-
-    Returns (frames_modified, tags_removed). Frames are modified in place;
-    call ``demo.write()`` afterwards.
+    Returns (frames_modified, tags_removed, tags_left). ``tags_left`` counts
+    occurrences that were found but deliberately not touched -- a frame whose
+    structure did not parse, or a tag sitting outside an entity's field data.
+    Frames are modified in place; call ``demo.write()`` afterwards.
     """
     tags = [t if isinstance(t, bytes) else str(t).encode("utf-8") for t in tags]
     tags = [t for t in tags if t]
-    modified = 0
-    removed = 0
+    if not tags:
+        raise ValueError("no text to remove was given")
+    modified = removed = left = 0
     frames = demo.frames
     total = len(frames)
-    for i, fr in enumerate(frames):
+    for i, frame in enumerate(frames):
         if progress and i % 2000 == 0:
             progress(i, total)
-        if not deep and (not fr.compressed or fr.msg_type not in ENTITY_FRAME_TYPES):
+        if frame.msg_type not in ENTITY_FRAME_TYPES:
+            continue
+        payload = demo.payload(frame)
+        found = len(pattern_hits(payload, tags))
+        if not found:
             continue
         try:
-            payload = bytearray(demo.payload(fr))
-        except Exception:
+            new_payload, n = strip_frame_payload(payload, frame.msg_type, tags)
+        except ProtoError:
+            left += found
             continue
-        # collect (start_bit, bit_len) hits of all tags in this frame
-        hits = []
-        for tag in tags:
-            hits.extend((start_bit, len(tag) * 8)
-                        for start_bit in find_tag_positions(bytes(payload), tag))
-        if not hits:
+        left += found - n
+        if not n:
             continue
-        # delete later occurrences first so earlier bit offsets stay valid;
-        # drop hits overlapping an already-scheduled (later) range
-        hits.sort(reverse=True)
-        scheduled = []
-        prev_start = None
-        for start_bit, bit_len in hits:
-            if prev_start is not None and start_bit + bit_len > prev_start:
-                continue
-            scheduled.append((start_bit, bit_len))
-            prev_start = start_bit
-        frame_removed = 0
-        for start_bit, bit_len in scheduled:
-            try:
-                payload = bytearray(proto_delete_bits(bytes(payload), start_bit, bit_len))
-            except ProtoError:
-                if not deep:
-                    raise
-                break  # structure not understood: leave this frame untouched
-            frame_removed += 1
-        if frame_removed < len(scheduled):
-            continue
-        removed += frame_removed
-        demo.set_payload(fr, bytes(payload))
+        demo.set_payload(frame, new_payload)
         modified += 1
-    return modified, removed
+        removed += n
+    return modified, removed, left
 
 
-def strip_file(src: str, dst: str, tags=(DEFAULT_TAG,), deep=False, progress=None) -> tuple[int, int, int]:
+def strip_file(src: str, dst: str, tags, progress=None) -> tuple[int, int, int, int]:
     """Convenience: load src, strip tags, write dst.
 
-    Returns (frames_modified, tags_removed, size_delta).
+    Returns (frames_modified, tags_removed, size_delta, tags_left).
     """
     demo = DemoFile(src)
-    n, removed = strip_name_tags(demo, tags=tags, deep=deep, progress=progress)
+    modified, removed, left = strip_name_tags(demo, tags=tags, progress=progress)
     delta = demo.write(dst)
-    return n, removed, delta
+    return modified, removed, delta, left

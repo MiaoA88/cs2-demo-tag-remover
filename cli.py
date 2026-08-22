@@ -2,7 +2,7 @@
 """Remove name tags from CS2 demo files.
 
 Usage:
-    python cli.py <input.dem> [output.dem] [options]
+    python cli.py <input.dem> [output.dem] --tag "TEXT TO REMOVE"
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 
-from tag_strip import DEFAULT_TAG, strip_file
+from tag_strip import strip_file
 
 
 def default_output(path: str) -> str:
@@ -26,11 +26,8 @@ def main(argv=None):
     parser.add_argument("output", nargs="?",
                         help="output .dem file (default: <input>_cleaned.dem)")
     parser.add_argument("--tag", action="append", default=[], metavar="TEXT",
-                        help="additional tag text to remove (repeatable; the "
-                             "default tag is always included)")
-    parser.add_argument("--deep", action="store_true",
-                        help="scan every frame instead of only entity-data "
-                             "frames (slower, but finds tags anywhere)")
+                        required=True,
+                        help="the text to remove (repeatable to remove several)")
     args = parser.parse_args(argv)
 
     src = args.input
@@ -40,7 +37,9 @@ def main(argv=None):
     if os.path.abspath(src) == os.path.abspath(dst):
         parser.error("input and output must be different files")
 
-    tags = [DEFAULT_TAG] + [t.encode("utf-8") for t in args.tag if t.strip()]
+    tags = [t.encode("utf-8") for t in args.tag if t.strip()]
+    if not tags:
+        parser.error("--tag must not be empty")
     print(f"input:  {src}")
     print(f"output: {dst}")
     print(f"tags:   {[t.decode('utf-8', 'replace') for t in tags]}")
@@ -48,9 +47,11 @@ def main(argv=None):
     def progress(done, total):
         print(f"\rscanning... {done}/{total} frames", end="", flush=True)
 
-    n, removed, delta = strip_file(src, dst, tags=tags, deep=args.deep, progress=progress)
+    n, removed, delta, left = strip_file(src, dst, tags=tags, progress=progress)
     print()
     print(f"done: removed {removed} tag(s) from {n} frame(s), size delta {delta:+d} bytes")
+    if left:
+        print(f"warning: {left} occurrence(s) left untouched (unrecognised structure)")
     return 0
 
 

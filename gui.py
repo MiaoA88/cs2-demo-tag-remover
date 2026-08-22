@@ -11,10 +11,12 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from tag_strip import DEFAULT_TAG, strip_file
+from tag_strip import strip_file
 
 APP_TITLE = "CS2 Demo 名称标签清除工具"
-DEFAULT_TAG_TEXT = DEFAULT_TAG.decode("ascii")
+
+#: Shown greyed out in the tag field until the user types something.
+PLACEHOLDER = "这里填写要清除的字段"
 
 
 def default_output(path: str) -> str:
@@ -56,14 +58,12 @@ class App:
         row3 = ttk.Frame(frm)
         row3.pack(fill="x", **pad)
         ttk.Label(row3, text="标签文本：", width=12).pack(side="left")
-        self.tag_var = tk.StringVar(value=DEFAULT_TAG_TEXT)
-        ttk.Entry(row3, textvariable=self.tag_var).pack(side="left", fill="x", expand=True)
+        self.tag_var = tk.StringVar(value=PLACEHOLDER)
+        self.tag_entry = ttk.Entry(row3, textvariable=self.tag_var, foreground="gray")
+        self.tag_entry.pack(side="left", fill="x", expand=True)
+        self.tag_entry.bind("<FocusIn>", self._tag_focus_in)
+        self.tag_entry.bind("<FocusOut>", self._tag_focus_out)
         ttk.Label(row3, text="（多个用逗号分隔）").pack(side="left", padx=6)
-
-        self.deep_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm, text="深度扫描所有帧（更彻底，较慢）", variable=self.deep_var
-        ).pack(anchor="w", **pad)
 
         self.bar = ttk.Progressbar(frm, mode="determinate")
         self.bar.pack(fill="x", **pad)
@@ -88,17 +88,32 @@ class App:
         if path:
             self.out_var.set(path)
 
+    def _tag_focus_in(self, _event=None):
+        if self.tag_var.get() == PLACEHOLDER:
+            self.tag_var.set("")
+            self.tag_entry.configure(foreground="black")
+
+    def _tag_focus_out(self, _event=None):
+        if not self.tag_var.get().strip():
+            self.tag_var.set(PLACEHOLDER)
+            self.tag_entry.configure(foreground="gray")
+
     def _tags(self):
-        raw = self.tag_var.get().replace("，", ",")
-        tags = [p.strip().encode("utf-8") for p in raw.split(",")]
-        tags = [t for t in tags if t]
-        return tags or [DEFAULT_TAG]
+        raw = self.tag_var.get()
+        if raw == PLACEHOLDER:
+            return []
+        tags = [p.strip().encode("utf-8") for p in raw.replace("，", ",").split(",")]
+        return [t for t in tags if t]
 
     def start(self):
         src = self.in_var.get().strip()
         dst = self.out_var.get().strip()
+        tags = self._tags()
         if not src or not os.path.isfile(src):
             messagebox.showerror(APP_TITLE, "请选择有效的输入 demo 文件")
+            return
+        if not tags:
+            messagebox.showerror(APP_TITLE, "请填写要清除的文字")
             return
         if not dst:
             dst = default_output(src)
@@ -109,21 +124,22 @@ class App:
         self.btn.config(state="disabled")
         self.bar["value"] = 0
         threading.Thread(
-            target=self._work, args=(src, dst, self._tags(), self.deep_var.get()), daemon=True
+            target=self._work, args=(src, dst, tags), daemon=True
         ).start()
 
-    def _work(self, src, dst, tags, deep):
+    def _work(self, src, dst, tags):
         def progress(done, total):
             self.root.after(0, lambda: self.bar.configure(maximum=total, value=done))
             self.root.after(0, lambda: self.status.set(f"扫描中… {done}/{total} 帧"))
 
-        def done_ok(n, removed, delta):
+        def done_ok(n, removed, delta, left):
             self.bar["value"] = self.bar["maximum"]
             self.btn.config(state="normal")
             self.status.set(f"完成：删除 {removed} 个标签（{n} 帧，大小变化 {delta:+d} 字节）")
+            warn = f"\n\n注意：{left} 处未能安全删除（结构无法识别），已原样保留。" if left else ""
             messagebox.showinfo(
                 APP_TITLE,
-                f"清除完成！\n\n删除标签：{removed} 个（{n} 帧）\n输出文件：{dst}",
+                f"清除完成！\n\n删除标签：{removed} 个（{n} 帧）\n输出文件：{dst}{warn}",
             )
 
         def done_err(e):
@@ -132,11 +148,11 @@ class App:
             messagebox.showerror(APP_TITLE, f"处理失败：\n{e}")
 
         try:
-            n, removed, delta = strip_file(src, dst, tags=tags, deep=deep, progress=progress)
+            n, removed, delta, left = strip_file(src, dst, tags=tags, progress=progress)
         except Exception as exc:  # noqa: BLE001
             self.root.after(0, lambda: done_err(exc))
             return
-        self.root.after(0, lambda: done_ok(n, removed, delta))
+        self.root.after(0, lambda: done_ok(n, removed, delta, left))
 
 
 def main(argv=None):

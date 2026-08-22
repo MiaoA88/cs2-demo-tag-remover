@@ -7,7 +7,8 @@ File layout:
   [0x0C..0x10)  u32  second file-length-related field
   [0x10..)      frame stream: varint(cmd) varint(tick) varint(size) data[size]
                 cmd bit 6 (0x40) = compressed (snappy), low 6 bits = EDemoCommands
-  (no directory table at EOF; the stream is read sequentially)
+  (no directory table at EOF; the stream is read sequentially to the end --
+   DEM_Stop is not a reliable terminator, real frames follow it)
 """
 from __future__ import annotations
 
@@ -106,8 +107,6 @@ class DemoFile:
                 raise DemoFormatError(f"bad frame size {size} at {ptr:#x}")
             self.frames.append(Frame(cmd, tick, size, ptr, head_len=ptr - start))
             ptr += size
-            if self.frames[-1].msg_type == 11:  # Stop
-                break
 
     def payload(self, frame) -> bytes:
         """Return frame payload bytes (decompressed if the frame is compressed)."""

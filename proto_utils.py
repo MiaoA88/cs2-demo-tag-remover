@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Minimal protobuf walker used to delete bits inside a nested bytes field.
+"""Bit-level and protobuf primitives for CS2 demo surgery.
 
-CS2 demo frames are snappy-compressed protobuf messages. Entity data (e.g.
-the ClassInfo field-3 blob or string-table baseline user data) lives inside
-nested `bytes` fields.  Deleting bits from that inner bit stream shrinks the
-blob, so every enclosing length varint must be rewritten -- this module does
-that.
+Three layers are involved, from outside in:
 
-A payload is treated as a protobuf message only while it parses cleanly;
-otherwise it is treated as a CDemoPacket-style container or a raw entity bit
-stream (the innermost layer).
+1. protobuf messages (``CDemoPacket``, ``CDemoFullPacket``, ``CSVCMsg_*``) --
+   :func:`parse_fields` / :func:`encode_fields`.
+2. the ``CDemoPacket.data`` *container*: a bit-packed sequence of
+   ``u_bit_var(msg type) + varint(byte size) + payload`` --
+   :func:`parse_container` / :func:`encode_container`.  The container is not
+   byte-aligned, so the few leftover bits at its end are carried over verbatim.
+3. the raw entity bit stream inside ``CSVCMsg_PacketEntities.entity_data`` --
+   :func:`find_bit_pattern` / :func:`pattern_hits` locate a byte pattern at any
+   bit alignment, :func:`delete_bits_from_bitstream` cuts bits out of it.
+
+All bit orders are LSB-first, which matches little-endian integer semantics:
+bit *i* of the stream is bit *i* of ``int.from_bytes(data, "little")``.
 """
 from __future__ import annotations
-
-MAX_DEPTH = 12
 
 
 class ProtoError(Exception):
@@ -23,16 +26,24 @@ class ProtoError(Exception):
 class BitReader:
     """LSB-first bit reader."""
 
+    __slots__ = ("data", "bit", "_end")
+
     def __init__(self, data):
         self.data = data
         self.bit = 0
+        self._end = len(data) * 8
 
     def read_nbits(self, n):
-        v = 0
-        for i in range(n):
-            v |= ((self.data[(self.bit + i) >> 3] >> ((self.bit + i) & 7)) & 1) << i
-        self.bit += n
-        return v
+        start = self.bit
+        end = start + n
+        if end > self._end:
+            raise IndexError("bit read past end of stream")
+        if n == 0:
+            return 0
+        p0 = start >> 3
+        v = int.from_bytes(self.data[p0:(end + 7) >> 3], "little") >> (start - (p0 << 3))
+        self.bit = end
+        return v & ((1 << n) - 1)
 
     def read_u_bit_var(self):
         bits = self.read_nbits(6)
@@ -48,43 +59,49 @@ class BitReader:
     def read_varint(self):
         result = 0
         count = 0
-        while True:
-            if count >= 5:
-                return result
+        while count < 5:
             b = self.read_nbits(8)
             result |= (b & 127) << (7 * count)
             count += 1
-            if b & 0x80 == 0:
+            if not b & 0x80:
                 break
         return result
 
     def read_bytes(self, n):
-        return bytes(self.read_nbits(8) for _ in range(n))
+        return self.read_nbits(n * 8).to_bytes(n, "little") if n else b""
 
     def bits_left(self):
-        return len(self.data) * 8 - self.bit
+        return self._end - self.bit
 
 
 class BitWriter:
+    """LSB-first bit writer."""
+
+    __slots__ = ("acc", "bit_len")
+
     def __init__(self):
-        self.bits = []
+        self.acc = 0
+        self.bit_len = 0
 
     def write(self, value, n):
-        for i in range(n):
-            self.bits.append((value >> i) & 1)
+        if n:
+            self.acc |= (value & ((1 << n) - 1)) << self.bit_len
+            self.bit_len += n
 
     def write_u_bit_var(self, value):
         if value < 16:
             self.write(value, 6)
-        elif value < 16 + (16 << 4):
+        elif value < 1 << 8:
             self.write(0b010000 | (value & 0b1111), 6)
             self.write(value >> 4, 4)
-        elif value < 16 + (16 << 8):
+        elif value < 1 << 12:
             self.write(0b100000 | (value & 0b1111), 6)
             self.write(value >> 4, 8)
-        else:
+        elif value < 1 << 32:
             self.write(0b110000 | (value & 0b1111), 6)
             self.write(value >> 4, 28)
+        else:
+            raise ProtoError(f"u_bit_var out of range: {value}")
 
     def write_varint(self, value):
         while True:
@@ -97,15 +114,10 @@ class BitWriter:
                 break
 
     def write_bytes(self, data):
-        for b in data:
-            self.write(b, 8)
+        self.write(int.from_bytes(data, "little"), len(data) * 8)
 
     def to_bytes(self):
-        out = bytearray((len(self.bits) + 7) // 8)
-        for i, b in enumerate(self.bits):
-            if b:
-                out[i >> 3] |= 1 << (i & 7)
-        return bytes(out)
+        return self.acc.to_bytes((self.bit_len + 7) >> 3, "little")
 
 
 def read_varint(data, pos):
@@ -127,7 +139,7 @@ def read_varint(data, pos):
 
 def write_varint(val):
     if val < 0:
-        val &= (1 << 64) - 1
+        raise ProtoError(f"negative varint: {val}")
     out = bytearray()
     while True:
         b = val & 0x7F
@@ -141,11 +153,11 @@ def write_varint(val):
 
 
 def parse_fields(data):
-    """Parse top-level protobuf fields of `data`.
+    """Parse the top-level protobuf fields of `data`.
 
-    Returns list of (field_no, wire_type, value) where value is an int for
-    varint fields and bytes for length-delimited / fixed fields.
-    Raises ProtoError if the data is not a clean protobuf message.
+    Returns a list of (field_no, wire_type, value) in wire order, where value is
+    an int for varints and bytes for length-delimited / fixed fields.
+    Raises ProtoError if `data` is not a clean protobuf message.
     """
     fields = []
     pos = 0
@@ -156,21 +168,21 @@ def parse_fields(data):
         wt = tag & 7
         if field_no == 0:
             raise ProtoError("field 0")
-        if wt == 0:  # varint
+        if wt == 0:
             v, pos = read_varint(data, pos)
             fields.append((field_no, wt, v))
-        elif wt == 2:  # length-delimited
+        elif wt == 2:
             ln, p2 = read_varint(data, pos)
             if p2 + ln > n:
                 raise ProtoError("length-delimited out of bounds")
             fields.append((field_no, wt, bytes(data[p2:p2 + ln])))
             pos = p2 + ln
-        elif wt == 1:  # fixed64
+        elif wt == 1:
             if pos + 8 > n:
                 raise ProtoError("fixed64 out of bounds")
             fields.append((field_no, wt, bytes(data[pos:pos + 8])))
             pos += 8
-        elif wt == 5:  # fixed32
+        elif wt == 5:
             if pos + 4 > n:
                 raise ProtoError("fixed32 out of bounds")
             fields.append((field_no, wt, bytes(data[pos:pos + 4])))
@@ -181,10 +193,10 @@ def parse_fields(data):
 
 
 def encode_fields(fields):
+    """Inverse of :func:`parse_fields` (byte-exact for canonically encoded input)."""
     out = bytearray()
     for field_no, wt, value in fields:
-        tag = write_varint((field_no << 3) | wt)
-        out += tag
+        out += write_varint((field_no << 3) | wt)
         if wt == 0:
             out += write_varint(value)
         elif wt == 2:
@@ -192,130 +204,130 @@ def encode_fields(fields):
             out += value
         elif wt in (1, 5):
             out += value
-        else:  # pragma: no cover
+        else:
             raise ProtoError(f"unsupported wire type {wt}")
     return bytes(out)
 
 
-def delete_bits_from_bitstream(data: bytes, bit_offset: int, bit_len: int) -> bytes:
-    """Delete `bit_len` bits at `bit_offset` (LSB-first) from a raw byte blob,
-    shifting the remaining bits left. Returns the shorter blob."""
-    n_bits = len(data) * 8
-    if bit_offset < 0 or bit_offset + bit_len > n_bits:
-        raise ProtoError("bit range out of bounds")
-    new_n_bits = n_bits - bit_len
-    out = bytearray((new_n_bits + 7) // 8)
-    for i in range(bit_offset):
-        if (data[i >> 3] >> (i & 7)) & 1:
-            out[i >> 3] |= 1 << (i & 7)
-    for i in range(bit_offset + bit_len, n_bits):
-        if (data[i >> 3] >> (i & 7)) & 1:
-            j = i - bit_len
-            out[j >> 3] |= 1 << (j & 7)
-    return bytes(out)
+def parse_container(blob):
+    """Parse a ``CDemoPacket.data`` container.
 
-
-def container_delete_bits(blob, bit_offset, bit_len, _depth=0):
-    """Delete bits inside a CDemoPacket-style container (u_bit_var msg type +
-    varint byte size + payload, repeated). Rewrites the target message's size
-    and rebuilds the container bit-exactly (headers may be bit-aligned)."""
-    if _depth > MAX_DEPTH:
-        raise ProtoError("too deep")
-    msgs = []
-    br = BitReader(blob)
-    while br.bits_left() >= 8:
-        start = br.bit
-        mt = br.read_u_bit_var()
-        sz = br.read_varint()
-        if sz == 0 or br.bit + sz * 8 > len(blob) * 8:
-            raise ProtoError("oversized message -> not a container")
-        hdr_bits = br.bit - start
-        data = br.read_bytes(sz)
-        msgs.append((mt, sz, start, hdr_bits, data))
-    if not msgs:
-        raise ProtoError("empty container")
-    for i, (mt, sz, start, hdr_bits, data) in enumerate(msgs):
-        data_start = start + hdr_bits
-        if data_start <= bit_offset < data_start + sz * 8 and bit_offset + bit_len <= data_start + sz * 8:
-            inner = bit_offset - data_start
-            new_data = proto_delete_bits(data, inner, bit_len, _depth + 1)
-            out = BitWriter()
-            for j, (mt2, sz2, _s2, _h2, d2) in enumerate(msgs):
-                if j == i:
-                    out.write_u_bit_var(mt2)
-                    out.write_varint(len(new_data))
-                    out.write_bytes(new_data)
-                else:
-                    out.write_u_bit_var(mt2)
-                    out.write_varint(sz2)
-                    out.write_bytes(d2)
-            return out.to_bytes()
-    raise ProtoError("bit range not inside any container message")
-
-
-def proto_delete_bits(data: bytes, bit_offset: int, bit_len: int, _depth: int = 0) -> bytes:
-    """Delete bits at `bit_offset` (relative to `data`) from the innermost bytes
-    field containing them, rewriting all enclosing length varints."""
-    if _depth > MAX_DEPTH:
-        raise ProtoError("too deep")
-    try:
-        fields = parse_fields(data)
-    except ProtoError:
-        # not a protobuf message -> CDemoPacket-style container or raw bit stream
-        try:
-            return container_delete_bits(data, bit_offset, bit_len, _depth)
-        except ProtoError:
-            return delete_bits_from_bitstream(data, bit_offset, bit_len)
-
-    out_fields = []
-    deleted = False
-    for field_no, wt, value in fields:
-        if wt == 2 and not deleted:
-            start_byte = _field_value_start(data, fields, field_no, wt, value)
-            # value occupies [start_byte, start_byte + len(value))
-            v_start_bits = start_byte * 8
-            v_end_bits = v_start_bits + len(value) * 8
-            if v_start_bits <= bit_offset < v_end_bits and bit_offset + bit_len <= v_end_bits:
-                new_value = proto_delete_bits(value, bit_offset - v_start_bits, bit_len, _depth + 1)
-                out_fields.append((field_no, wt, new_value))
-                deleted = True
-                continue
-        out_fields.append((field_no, wt, value))
-    if not deleted:
-        raise ProtoError("bit range not inside any bytes field")
-    return encode_fields(out_fields)
-
-
-def _field_value_start(data, fields, field_no, wt, value):
-    """Byte offset where a given length-delimited field's value starts in `data`.
-
-    Re-walks the fields, accumulating offsets (parse_fields does not track them).
+    Returns (messages, tail, tail_bits) where messages is a list of
+    (msg_type, payload) in order and tail/tail_bits are the leftover padding bits
+    at the end of the blob (0..7 bits, kept so the container can be rebuilt
+    bit-exactly).
     """
-    pos = 0
-    for fno, fwt, fval in fields:
-        tag_len = _varint_len(data, pos)
-        pos += tag_len
-        if fwt == 0:
-            _, pos = read_varint(data, pos)
-        elif fwt == 2:
-            ln, p2 = read_varint(data, pos)
-            if fno == field_no and fwt == wt and fval == value:
-                return p2
-            pos = p2 + ln
-        elif fwt == 1:
-            pos += 8
-        elif fwt == 5:
-            pos += 4
-        else:  # pragma: no cover
-            raise ProtoError("bad wire type")
-    raise ProtoError("field not found")
+    br = BitReader(blob)
+    total = len(blob) * 8
+    messages = []
+    while br.bits_left() >= 8:
+        msg_type = br.read_u_bit_var()
+        size = br.read_varint()
+        if br.bit + size * 8 > total:
+            raise ProtoError("container message overruns the blob")
+        messages.append((msg_type, br.read_bytes(size)))
+    if not messages:
+        raise ProtoError("empty container")
+    tail_bits = total - br.bit
+    return messages, br.read_nbits(tail_bits), tail_bits
 
 
-def _varint_len(data, pos):
-    n = 0
-    while True:
-        if data[pos] & 0x80:
-            n += 1
-            pos += 1
-        else:
-            return n + 1
+def encode_container(messages, tail, tail_bits):
+    """Inverse of :func:`parse_container`."""
+    out = BitWriter()
+    for msg_type, payload in messages:
+        out.write_u_bit_var(msg_type)
+        out.write_varint(len(payload))
+        out.write_bytes(payload)
+    if (out.bit_len + tail_bits) % 8:
+        raise ProtoError("rebuilt container is no longer byte-aligned")
+    out.write(tail, tail_bits)
+    return out.to_bytes()
+
+
+def delete_bits_from_bitstream(data, bit_offset, bit_len):
+    """Delete `bit_len` bits at `bit_offset` (LSB-first), shifting the rest down."""
+    n_bits = len(data) * 8
+    if bit_offset < 0 or bit_len < 0 or bit_offset + bit_len > n_bits:
+        raise ProtoError("bit range out of bounds")
+    value = int.from_bytes(data, "little")
+    low = value & ((1 << bit_offset) - 1)
+    high = value >> (bit_offset + bit_len)
+    return (low | (high << bit_offset)).to_bytes((n_bits - bit_len + 7) >> 3, "little")
+
+
+def _pattern_bits(pattern):
+    """LSB-first bit list of `pattern`."""
+    return [(b >> i) & 1 for b in pattern for i in range(8)]
+
+
+def _suffix_patterns(pattern):
+    """Return 8 (shift, suffix_bytes) pairs, one per bit alignment.
+
+    If `pattern` starts at bit offset B with ``B % 8 == s``, the bytes at
+    positions ``B//8 + 1 .. B//8 + len(pattern) - 1`` equal ``suffix_bytes``.
+    Those bytes are determined by the pattern alone, so they can be located with
+    C-level :meth:`bytes.find` whatever surrounds the pattern. The pattern's
+    leading ``8 - s`` bits and trailing ``s`` bits share a byte with the
+    neighbouring data and are therefore not part of the searched suffix.
+    """
+    pb = _pattern_bits(pattern)
+    whole = len(pattern) - 1
+    out = []
+    for s in range(8):
+        bits = pb[8 - s:8 - s + whole * 8]
+        buf = bytearray(whole)
+        for k, b in enumerate(bits):
+            if b:
+                buf[k >> 3] |= 1 << (k & 7)
+        out.append((s, bytes(buf)))
+    return out
+
+
+def _matches_at(data, start_bit, pat_bits):
+    if start_bit < 0 or start_bit + len(pat_bits) > len(data) * 8:
+        return False
+    for k, pb in enumerate(pat_bits):
+        bit = start_bit + k
+        if ((data[bit >> 3] >> (bit & 7)) & 1) != pb:
+            return False
+    return True
+
+
+def find_bit_pattern(data: bytes, pattern: bytes) -> list[int]:
+    """Bit offsets at which `pattern` occurs in `data`, at any bit alignment."""
+    pat_bits = _pattern_bits(pattern)
+    hits = []
+    for s, suffix in _suffix_patterns(pattern):
+        pos = 0
+        while True:
+            idx = data.find(suffix, pos)
+            if idx < 0:
+                break
+            start_bit = idx * 8 - (8 - s)
+            if _matches_at(data, start_bit, pat_bits):
+                hits.append(start_bit)
+            pos = idx + 1
+    return hits
+
+
+def pattern_hits(data: bytes, patterns) -> list[tuple[int, int]]:
+    """All (start_bit, bit_len) occurrences of any of `patterns` in `data`.
+
+    Ordered from the end of the stream towards its start and with overlapping
+    ranges dropped, so the hits can be deleted one after another without
+    invalidating the offsets that are still pending.
+    """
+    hits = []
+    for pattern in patterns:
+        hits.extend((start_bit, len(pattern) * 8)
+                    for start_bit in find_bit_pattern(data, pattern))
+    hits.sort(reverse=True)
+    out = []
+    prev_start = None
+    for start_bit, bit_len in hits:
+        if prev_start is not None and start_bit + bit_len > prev_start:
+            continue
+        out.append((start_bit, bit_len))
+        prev_start = start_bit
+    return out
