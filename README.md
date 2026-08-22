@@ -2,6 +2,8 @@
 
 [中文](#中文) · [English](#english)
 
+![image](image.jpg)
+
 ---
 
 ## 中文
