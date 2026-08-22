@@ -82,10 +82,6 @@ python -m PyInstaller --onefile --windowed --name CS2DemoTagRemover gui.py
 - 若某帧的实体位流与其位长度表不吻合，该帧原样保留而不重写。
 - 一次处理一个文件；输入输出不能是同一路径。
 
-### 开发笔记
-
-demo 格式的逆向硬事实、排查思路与验证方法见 [NOTES.md](NOTES.md)。
-
 ### 许可证
 
 MIT — 见 [LICENSE](LICENSE)。
@@ -172,11 +168,6 @@ The result is a single self-contained `dist/CS2DemoTagRemover.exe`.
 - Only text inside an entity's field data is removed. An occurrence elsewhere (for example in the end-of-match econ message) is counted and reported, not touched.
 - A frame whose entity stream does not match its size table is left byte-identical rather than rewritten.
 - One file at a time; input and output must be different files.
-
-### Development notes
-
-The reverse-engineered format facts, the debugging approach and the validation
-method are written up in [NOTES.md](NOTES.md) (Chinese).
 
 ### License
 
